@@ -6,7 +6,7 @@ I use this firmware as an experimental branch where I can quickly test new ideas
 
 ## Credits
 
-- Shoutout to Dave Alli for making this firmware: [daveallie](https://github.com/daveallie)
+- Shoutout to Dave Allie for making this firmware: [daveallie](https://github.com/daveallie)
 - Official Crosspoint repository: [crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader)
 - Dictionary feature source: [kurtisgrant/crosspoint-reader](https://github.com/kurtisgrant/crosspoint-reader)
 
