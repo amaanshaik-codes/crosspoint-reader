@@ -47,10 +47,20 @@ class GfxRenderer {
   // recording to the (non-const) FontCacheManager. Same pragmatic compromise
   // as before, concentrated in a single pointer instead of four fields.
   mutable FontCacheManager* fontCacheManager_ = nullptr;
+  mutable bool dirtyRegionValid = false;
+  mutable int dirtyMinX = 0;
+  mutable int dirtyMinY = 0;
+  mutable int dirtyMaxX = 0;
+  mutable int dirtyMaxY = 0;
+  mutable unsigned long lastLocalGhostingMs = 0;
 
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
   void freeBwBufferChunks();
+  void markDirtyPixelPhysical(int phyX, int phyY) const;
+  void markDirtyRegionPhysical(int phyX, int phyY, int width, int height) const;
+  void resetDirtyRegion() const;
+  bool tryLocalGhostingRefresh(HalDisplay::RefreshMode refreshMode) const;
   template <Color color>
   void drawPixelDither(int x, int y) const;
   template <Color color>

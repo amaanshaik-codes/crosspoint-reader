@@ -5,6 +5,7 @@
 #include <Logging.h>
 #include <Utf8.h>
 
+#include "../Epub/Epub/converters/DitherUtils.h"
 #include "FontCacheManager.h"
 
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
@@ -34,6 +35,7 @@ void GfxRenderer::begin() {
   panelWidthBytes = display.getDisplayWidthBytes();
   frameBufferSize = display.getBufferSize();
   bwBufferChunks.assign((frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE, nullptr);
+  resetDirtyRegion();
 }
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
@@ -127,11 +129,12 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           // we swap this to better match the way images and screen think about colors:
           // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
           const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+          const bool edgeDitherBit = ((screenX + screenY) & 1) == 0;
 
           if (renderMode == GfxRenderer::BW && bmpVal < 3) {
             // Black (also paints over the grays in BW mode)
             renderer.drawPixel(screenX, screenY, pixelState);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
+          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || (bmpVal == 2 && edgeDitherBit))) {
             // Light gray (also mark the MSB if it's going to be a dark gray too)
             // Dedicated X3 gray LUTs now provide proper 4-level gray on both devices
             // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
@@ -168,6 +171,139 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   }
 }
 
+void GfxRenderer::markDirtyPixelPhysical(const int phyX, const int phyY) const {
+  if (!dirtyRegionValid) {
+    dirtyMinX = phyX;
+    dirtyMinY = phyY;
+    dirtyMaxX = phyX;
+    dirtyMaxY = phyY;
+    dirtyRegionValid = true;
+    return;
+  }
+
+  if (phyX < dirtyMinX) dirtyMinX = phyX;
+  if (phyY < dirtyMinY) dirtyMinY = phyY;
+  if (phyX > dirtyMaxX) dirtyMaxX = phyX;
+  if (phyY > dirtyMaxY) dirtyMaxY = phyY;
+}
+
+void GfxRenderer::markDirtyRegionPhysical(const int phyX, const int phyY, const int width, const int height) const {
+  if (width <= 0 || height <= 0) return;
+
+  int x0 = phyX;
+  int y0 = phyY;
+  int x1 = phyX + width - 1;
+  int y1 = phyY + height - 1;
+
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 >= static_cast<int>(panelWidth)) x1 = panelWidth - 1;
+  if (y1 >= static_cast<int>(panelHeight)) y1 = panelHeight - 1;
+  if (x1 < x0 || y1 < y0) return;
+
+  if (!dirtyRegionValid) {
+    dirtyMinX = x0;
+    dirtyMinY = y0;
+    dirtyMaxX = x1;
+    dirtyMaxY = y1;
+    dirtyRegionValid = true;
+    return;
+  }
+
+  if (x0 < dirtyMinX) dirtyMinX = x0;
+  if (y0 < dirtyMinY) dirtyMinY = y0;
+  if (x1 > dirtyMaxX) dirtyMaxX = x1;
+  if (y1 > dirtyMaxY) dirtyMaxY = y1;
+}
+
+void GfxRenderer::resetDirtyRegion() const {
+  dirtyRegionValid = false;
+  dirtyMinX = 0;
+  dirtyMinY = 0;
+  dirtyMaxX = 0;
+  dirtyMaxY = 0;
+}
+
+bool GfxRenderer::tryLocalGhostingRefresh(const HalDisplay::RefreshMode refreshMode) const {
+  if (!fadingFix || refreshMode != HalDisplay::FAST_REFRESH || !dirtyRegionValid || !frameBuffer) {
+    return false;
+  }
+
+  constexpr int kWindowMarginPx = 2;
+  constexpr int kMinAreaDivisor = 14;
+  constexpr int kMaxAreaDivisor = 3;
+  constexpr unsigned long kLocalRefreshCooldownMs = 1400;
+
+  const unsigned long now = millis();
+  if (lastLocalGhostingMs != 0 && (now - lastLocalGhostingMs) < kLocalRefreshCooldownMs) {
+    return false;
+  }
+
+  const int dirtyWidth = dirtyMaxX - dirtyMinX + 1;
+  const int dirtyHeight = dirtyMaxY - dirtyMinY + 1;
+  const int dirtyArea = dirtyWidth * dirtyHeight;
+  const int fullArea = static_cast<int>(panelWidth) * static_cast<int>(panelHeight);
+  if (dirtyWidth <= 0 || dirtyHeight <= 0 || dirtyArea > (fullArea / kMaxAreaDivisor) ||
+      dirtyArea < (fullArea / kMinAreaDivisor)) {
+    return false;
+  }
+
+  int x0 = dirtyMinX - kWindowMarginPx;
+  int y0 = dirtyMinY - kWindowMarginPx;
+  int x1 = dirtyMaxX + kWindowMarginPx;
+  int y1 = dirtyMaxY + kWindowMarginPx;
+
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 >= static_cast<int>(panelWidth)) x1 = panelWidth - 1;
+  if (y1 >= static_cast<int>(panelHeight)) y1 = panelHeight - 1;
+
+  x0 &= ~0x7;
+  x1 |= 0x7;
+  if (x1 >= static_cast<int>(panelWidth)) x1 = panelWidth - 1;
+
+  const int windowWidth = x1 - x0 + 1;
+  const int windowHeight = y1 - y0 + 1;
+  if (windowWidth <= 0 || windowHeight <= 0 || (windowWidth & 0x7) != 0) {
+    return false;
+  }
+
+  const uint16_t windowWidthBytes = static_cast<uint16_t>(windowWidth / 8);
+  const uint16_t startByteX = static_cast<uint16_t>(x0 / 8);
+  const size_t rowBytes = panelWidthBytes;
+  std::vector<uint8_t> original(static_cast<size_t>(windowWidthBytes) * static_cast<size_t>(windowHeight));
+
+  for (int row = 0; row < windowHeight; row++) {
+    const uint8_t* src = frameBuffer + (static_cast<size_t>(y0 + row) * rowBytes) + startByteX;
+    uint8_t* dst = original.data() + (static_cast<size_t>(row) * windowWidthBytes);
+    memcpy(dst, src, windowWidthBytes);
+  }
+
+  for (int row = 0; row < windowHeight; row++) {
+    uint8_t* dst = frameBuffer + (static_cast<size_t>(y0 + row) * rowBytes) + startByteX;
+    memset(dst, 0x00, windowWidthBytes);
+  }
+  display.displayWindow(static_cast<uint16_t>(x0), static_cast<uint16_t>(y0), static_cast<uint16_t>(windowWidth),
+                       static_cast<uint16_t>(windowHeight), false);
+
+  for (int row = 0; row < windowHeight; row++) {
+    uint8_t* dst = frameBuffer + (static_cast<size_t>(y0 + row) * rowBytes) + startByteX;
+    memset(dst, 0xFF, windowWidthBytes);
+  }
+  display.displayWindow(static_cast<uint16_t>(x0), static_cast<uint16_t>(y0), static_cast<uint16_t>(windowWidth),
+                       static_cast<uint16_t>(windowHeight), false);
+
+  for (int row = 0; row < windowHeight; row++) {
+    uint8_t* dst = frameBuffer + (static_cast<size_t>(y0 + row) * rowBytes) + startByteX;
+    const uint8_t* src = original.data() + (static_cast<size_t>(row) * windowWidthBytes);
+    memcpy(dst, src, windowWidthBytes);
+  }
+  display.displayWindow(static_cast<uint16_t>(x0), static_cast<uint16_t>(y0), static_cast<uint16_t>(windowWidth),
+                       static_cast<uint16_t>(windowHeight), fadingFix);
+  lastLocalGhostingMs = now;
+  return true;
+}
+
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
 // efficient as possible.
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
@@ -186,6 +322,7 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   // Calculate byte position and bit position
   const uint32_t byteIndex = static_cast<uint32_t>(phyY) * panelWidthBytes + (phyX / 8);
   const uint8_t bitPosition = 7 - (phyX % 8);  // MSB first
+  markDirtyPixelPhysical(phyX, phyY);
 
   if (state) {
     frameBuffer[byteIndex] &= ~(1 << bitPosition);  // Clear bit
@@ -634,10 +771,53 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
   auto* outputRow = static_cast<uint8_t*>(malloc(outputRowSize));
   auto* rowBytes = static_cast<uint8_t*>(malloc(bitmap.getRowBytes()));
 
+  ErrorDiffusionState diffusionState{};
+  int16_t* diffusionCurr = nullptr;
+  int16_t* diffusionNext = nullptr;
+  uint8_t* diffusionToneA = nullptr;
+  uint8_t* diffusionToneB = nullptr;
+  int diffusionWidth = 0;
+  bool useErrorDiffusion = false;
+
+  const int croppedSourceWidth = bitmap.getWidth() - (cropPixX * 2);
+  const bool canUseErrorDiffusion =
+      (renderMode != BW) && (bitmap.getBpp() > 2) && !bitmap.usesInternalDithering() && (croppedSourceWidth > 0);
+
+  if (canUseErrorDiffusion) {
+    const float scaledWidth = isScaled ? (std::floor((croppedWidth - 1.0f) * scale) + 1.0f) : croppedWidth;
+    diffusionWidth = static_cast<int>(scaledWidth);
+    if (diffusionWidth < 1) diffusionWidth = 1;
+    if (diffusionWidth > kMaxErrorDiffusionWidth) diffusionWidth = kMaxErrorDiffusionWidth;
+
+    diffusionCurr = static_cast<int16_t*>(malloc(sizeof(int16_t) * (diffusionWidth + 2)));
+    diffusionNext = static_cast<int16_t*>(malloc(sizeof(int16_t) * (diffusionWidth + 2)));
+    diffusionToneA = static_cast<uint8_t*>(malloc(diffusionWidth));
+    diffusionToneB = static_cast<uint8_t*>(malloc(diffusionWidth));
+
+    if (diffusionCurr && diffusionNext) {
+      useErrorDiffusion = initErrorDiffusionState(diffusionState, diffusionCurr, diffusionNext, diffusionWidth);
+      if (useErrorDiffusion && diffusionToneA && diffusionToneB) {
+        attachToneRows(diffusionState, diffusionToneA, diffusionToneB);
+      }
+    }
+  }
+
+  auto releaseDiffusionBuffers = [&]() {
+    free(diffusionCurr);
+    free(diffusionNext);
+    free(diffusionToneA);
+    free(diffusionToneB);
+    diffusionCurr = nullptr;
+    diffusionNext = nullptr;
+    diffusionToneA = nullptr;
+    diffusionToneB = nullptr;
+  };
+
   if (!outputRow || !rowBytes) {
     LOG_ERR("GFX", "!! Failed to allocate BMP row buffers");
     free(outputRow);
     free(rowBytes);
+    releaseDiffusionBuffers();
     return;
   }
 
@@ -657,6 +837,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       LOG_ERR("GFX", "Failed to read row %d from bitmap", bmpY);
       free(outputRow);
       free(rowBytes);
+      releaseDiffusionBuffers();
       return;
     }
 
@@ -668,6 +849,8 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       // Skip the row if it's outside the crop area
       continue;
     }
+
+    int previousLocalX = -1;
 
     for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX; bmpX++) {
       int screenX = bmpX - cropPixX;
@@ -683,12 +866,28 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       }
 
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+      uint8_t renderVal = val;
 
-      if (renderMode == BW && val < 3) {
+      if (useErrorDiffusion) {
+        int localX = screenX - x;
+        if (localX < 0) continue;
+        if (localX >= diffusionWidth) localX = diffusionWidth - 1;
+
+        // Skip duplicate destination columns caused by downscaling to preserve stable left-to-right diffusion.
+        if (localX == previousLocalX) {
+          continue;
+        }
+        previousLocalX = localX;
+
+        const uint8_t gray = static_cast<uint8_t>(val * 85);
+        renderVal = applyErrorDiffusion4Level(gray, localX, screenY, diffusionState);
+      }
+
+      if (renderMode == BW && renderVal < 3) {
         drawPixel(screenX, screenY);
-      } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
+      } else if (renderMode == GRAYSCALE_MSB && (renderVal == 1 || renderVal == 2)) {
         drawPixel(screenX, screenY, false);
-      } else if (renderMode == GRAYSCALE_LSB && val == 1) {
+      } else if (renderMode == GRAYSCALE_LSB && renderVal == 1) {
         drawPixel(screenX, screenY, false);
       }
     }
@@ -696,6 +895,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 
   free(outputRow);
   free(rowBytes);
+  releaseDiffusionBuffers();
 }
 
 void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
@@ -841,6 +1041,7 @@ static unsigned long start_ms = 0;
 void GfxRenderer::clearScreen(const uint8_t color) const {
   start_ms = millis();
   display.clearScreen(color);
+  markDirtyRegionPhysical(0, 0, panelWidth, panelHeight);
 }
 
 void GfxRenderer::invertScreen() const {
@@ -852,7 +1053,21 @@ void GfxRenderer::invertScreen() const {
 void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
+
+  if (refreshMode == HalDisplay::FAST_REFRESH && renderMode != GfxRenderer::BW) {
+    // Ensure grayscale updates go through native 4-level LUTs instead of BW differential refresh.
+    display.displayGrayBuffer(fadingFix);
+    resetDirtyRegion();
+    return;
+  }
+
+  if (tryLocalGhostingRefresh(refreshMode)) {
+    resetDirtyRegion();
+    return;
+  }
+
   display.displayBuffer(refreshMode, fadingFix);
+  resetDirtyRegion();
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,

@@ -31,6 +31,45 @@ inline int clampInt(const int v, const int lo, const int hi) {
 
 inline int absInt(const int v) { return (v < 0) ? -v : v; }
 
+inline void computeDynamicClipThresholds(int toned, int edgeHint, int sceneBias, int* outBlackClip,
+                                         int* outWhiteClip) {
+  int blackClip = kBlackClipThreshold;
+  int whiteClip = kWhiteClipThreshold;
+
+  // Bright document scenes should bias toward cleaner whites.
+  // Dark photographic scenes should preserve more shadow detail.
+  if (sceneBias > 0) {
+    whiteClip += sceneBias;
+    blackClip += sceneBias / 2;
+  } else if (sceneBias < 0) {
+    blackClip += sceneBias;
+    whiteClip += sceneBias / 2;
+  }
+
+  if (toned < 120) {
+    blackClip -= (120 - toned) / 12;
+  }
+  if (toned > 170) {
+    whiteClip += (toned - 170) / 8;
+  }
+
+  if (edgeHint >= kStrongEdgeGradient) {
+    blackClip += 2;
+    whiteClip -= 2;
+  }
+
+  blackClip = clampInt(blackClip, 12, 42);
+  whiteClip = clampInt(whiteClip, 214, 246);
+  if (whiteClip - blackClip < 90) {
+    const int mid = (blackClip + whiteClip) >> 1;
+    blackClip = mid - 45;
+    whiteClip = mid + 45;
+  }
+
+  *outBlackClip = blackClip;
+  *outWhiteClip = whiteClip;
+}
+
 // Stateful error-diffusion tracking (scanline based, left-to-right).
 struct ErrorDiffusionState {
   int16_t* curr{nullptr};
@@ -81,12 +120,19 @@ inline void attachToneRows(ErrorDiffusionState& state, uint8_t* rowA, uint8_t* r
 }
 
 inline uint8_t applyEinkToneCurve(uint8_t gray) {
-  // S-curve remap: deeper shadows, brighter highlights.
+  // Gamma-darkening tuned for reflective e-ink (~1.7 effective gamma).
+  // Integer blend of linear and quadratic keeps this cheap in hot loops.
   int g = gray;
-  g = (g * (g + 128)) >> 8;
+  const int g2 = (g * g + 255) >> 8;
+  g = ((g2 * 5) + (g * 3)) >> 3;
 
-  // Contrast stretch around midpoint for small text clarity.
-  g = 128 + ((g - 128) * 164) / 128;
+  // Contrast stretch around midpoint for text and line-art readability.
+  g = 128 + ((g - 128) * 150) / 128;
+
+  // Recover highlight shoulder so page backgrounds stay crisp white.
+  if (g > 176) {
+    g += (g - 176) / 3;
+  }
   if (g < 0) g = 0;
   if (g > 255) g = 255;
   return static_cast<uint8_t>(g);
@@ -156,9 +202,14 @@ inline uint8_t applyBayerDither4Level(uint8_t gray, int x, int y) {
   if (contrasted < 0) contrasted = 0;
   if (contrasted > 255) contrasted = 255;
 
+  int blackClip = 0;
+  int whiteClip = 0;
+  const int sceneBias = clampInt((contrasted - 128) / 16, -6, 6);
+  computeDynamicClipThresholds(contrasted, 0, sceneBias, &blackClip, &whiteClip);
+
   // Hard clip extremes to preserve solid blacks/whites.
-  if (contrasted <= kBlackClipThreshold) return 0;
-  if (contrasted >= kWhiteClipThreshold) return 3;
+  if (contrasted <= blackClip) return 0;
+  if (contrasted >= whiteClip) return 3;
 
   const uint8_t baseLevel = quantize4LevelNearest((uint8_t)contrasted);
 
@@ -184,8 +235,12 @@ inline uint8_t applyBayerDither4Level(uint8_t gray, int x, int y) {
 // Non-dithered quantization with the same tone mapping and hard clipping.
 inline uint8_t quantizeImage4LevelNoDither(uint8_t gray) {
   int toned = applyEinkToneCurve(gray);
-  if (toned <= kBlackClipThreshold) return 0;
-  if (toned >= kWhiteClipThreshold) return 3;
+  int blackClip = 0;
+  int whiteClip = 0;
+  const int sceneBias = clampInt((toned - 128) / 16, -6, 6);
+  computeDynamicClipThresholds(toned, 0, sceneBias, &blackClip, &whiteClip);
+  if (toned <= blackClip) return 0;
+  if (toned >= whiteClip) return 3;
   return quantize4LevelNearest(static_cast<uint8_t>(toned));
 }
 
@@ -223,13 +278,9 @@ inline uint8_t applyErrorDiffusion4Level(uint8_t gray, int localX, int y, ErrorD
 
   // Adapt clips based on global scene brightness.
   const int sceneBias = clampInt((state.runningMean - 128) / 8, -8, 8);
-  int blackClip = clampInt(kBlackClipThreshold + (sceneBias > 0 ? sceneBias : sceneBias / 2), 16, 40);
-  int whiteClip = clampInt(kWhiteClipThreshold + (sceneBias < 0 ? sceneBias : sceneBias / 2), 216, 242);
-  if (whiteClip - blackClip < 90) {
-    const int mid = (blackClip + whiteClip) >> 1;
-    blackClip = mid - 45;
-    whiteClip = mid + 45;
-  }
+  int blackClip = 0;
+  int whiteClip = 0;
+  computeDynamicClipThresholds(toned, edge, sceneBias, &blackClip, &whiteClip);
 
   if (state.currToneRow && localX < state.width) {
     state.currToneRow[localX] = static_cast<uint8_t>(toned);

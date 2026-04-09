@@ -1,13 +1,13 @@
-# Amaan's Crosspoint Reader
+# My CrossPoint Reader - 
 
 This is my personal CrossPoint fork.
 
-I use this firmware as an experimental branch where I can quickly test new ideas and features without being limited by the official project scope.
+I use this firmware as an experimental branch where I can quickly test new ideas and features without being limited by the official project scope. 
 
 ## Credits
 
-- Shoutout to Dave Allie for making this firmware: [daveallie](https://github.com/daveallie)
-- Official Crosspoint repository: [crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader)
+- Dave Allie: [daveallie](https://github.com/daveallie)
+- Official CrossPoint repository: [crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader)
 - Dictionary feature source: [kurtisgrant/crosspoint-reader](https://github.com/kurtisgrant/crosspoint-reader)
 
 ## What I Focus On In This Fork

@@ -76,6 +76,7 @@ class Bitmap {
   int getRowBytes() const { return rowBytes; }
   bool is1Bit() const { return bpp == 1; }
   uint16_t getBpp() const { return bpp; }
+  bool usesInternalDithering() const { return dithering; }
 
  private:
   static uint16_t readLE16(FsFile& f);

@@ -2,6 +2,8 @@
 
 #include <HalPowerManager.h>
 
+#include "CrossPointState.h"
+
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
@@ -67,6 +69,7 @@ void ActivityManager::loop() {
         continue;
       }
 
+      const bool poppedReaderActivity = currentActivity->isReaderActivity();
       ActivityResult pendingResult = std::move(currentActivity->result);
 
       // Destroy the current activity
@@ -74,6 +77,14 @@ void ActivityManager::loop() {
       pendingAction = PendingAction::None;
 
       if (stackActivities.empty()) {
+        if (poppedReaderActivity) {
+          const std::string returnPath = APP_STATE.openEpubPath;
+          LOG_DBG("ACT", "Reader activity popped with empty stack, returning to file browser");
+          lock.unlock();  // goToFileBrowser may acquire its own lock
+          goToFileBrowser(returnPath);
+          continue;  // Will launch file browser immediately
+        }
+
         LOG_DBG("ACT", "No more activities on stack, going home");
         lock.unlock();  // goHome may acquire its own lock
         goHome();
