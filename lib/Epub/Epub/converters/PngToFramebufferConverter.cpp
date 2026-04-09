@@ -36,7 +36,25 @@ struct PngContext {
   bool caching{false};
 
   uint8_t* grayLineBuffer{nullptr};
+
+  bool useErrorDiffusion{false};
+  int16_t ditherCurr[kMaxErrorDiffusionWidth + 2]{};
+  int16_t ditherNext[kMaxErrorDiffusionWidth + 2]{};
+  ErrorDiffusionState ditherState;
+  uint8_t* toneRowA{nullptr};
+  uint8_t* toneRowB{nullptr};
 };
+
+void freeAdaptiveToneRows(PngContext& ctx) {
+  if (ctx.toneRowA) {
+    free(ctx.toneRowA);
+    ctx.toneRowA = nullptr;
+  }
+  if (ctx.toneRowB) {
+    free(ctx.toneRowB);
+    ctx.toneRowB = nullptr;
+  }
+}
 
 // File I/O callbacks use pFile->fHandle to access the FsFile*,
 // avoiding the need for global file state.
@@ -187,11 +205,12 @@ int pngDrawCallback(PNGDRAW* pDraw) {
   convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->pPalette,
                     pDraw->iHasAlpha);
 
-  // Render scaled row using Bresenham-style integer stepping (no floating-point division)
+  // Render scaled row with horizontal linear interpolation for better detail retention.
   int dstWidth = ctx->dstWidth;
   int outXBase = ctx->config->x;
   int screenWidth = ctx->screenWidth;
   bool useDithering = ctx->config->useDithering;
+  bool useErrorDiffusion = ctx->useErrorDiffusion;
   bool caching = ctx->caching;
 
   // Pre-compute orientation and render-mode state once per row
@@ -205,31 +224,41 @@ int pngDrawCallback(PNGDRAW* pDraw) {
     cw.beginRow(outY, ctx->config->y);
   }
 
-  int srcX = 0;
-  int error = 0;
+  constexpr int FP_SHIFT = 16;
+  constexpr int FP_ONE = 1 << FP_SHIFT;
+  int32_t srcStepFP = 0;
+  if (dstWidth > 1 && srcWidth > 1) {
+    srcStepFP = (int32_t)(((int64_t)(srcWidth - 1) * FP_ONE) / (dstWidth - 1));
+  }
+  int32_t srcPosFP = 0;
 
   for (int dstX = 0; dstX < dstWidth; dstX++) {
     int outX = outXBase + dstX;
     if (outX < screenWidth) {
-      uint8_t gray = ctx->grayLineBuffer[srcX];
+      int srcX0 = srcPosFP >> FP_SHIFT;
+      if (srcX0 < 0) srcX0 = 0;
+      if (srcX0 >= srcWidth) srcX0 = srcWidth - 1;
+      int srcX1 = (srcX0 + 1 < srcWidth) ? srcX0 + 1 : srcX0;
+      int frac = srcPosFP & (FP_ONE - 1);
+      uint8_t gray = (uint8_t)(((int)ctx->grayLineBuffer[srcX0] * (FP_ONE - frac)
+                                + (int)ctx->grayLineBuffer[srcX1] * frac)
+                               >> FP_SHIFT);
 
       uint8_t ditheredGray;
       if (useDithering) {
-        ditheredGray = applyBayerDither4Level(gray, outX, outY);
+        if (useErrorDiffusion) {
+          ditheredGray = applyErrorDiffusion4Level(gray, dstX, outY, ctx->ditherState);
+        } else {
+          ditheredGray = applyBayerDither4Level(gray, outX, outY);
+        }
       } else {
-        ditheredGray = gray / 85;
-        if (ditheredGray > 3) ditheredGray = 3;
+        ditheredGray = quantizeImage4LevelNoDither(gray);
       }
       pw.writePixel(outX, ditheredGray);
       if (caching) cw.writePixel(outX, ditheredGray);
     }
 
-    // Bresenham-style stepping: advance srcX based on ratio srcWidth/dstWidth
-    error += srcWidth;
-    while (error >= dstWidth) {
-      error -= dstWidth;
-      srcX++;
-    }
+    srcPosFP += srcStepFP;
   }
 
   return 1;
@@ -324,6 +353,13 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     ctx.dstHeight = (int)(ctx.srcHeight * ctx.scale);
   }
   ctx.lastDstY = -1;  // Reset row tracking
+  if (config.useDithering) {
+    ctx.useErrorDiffusion =
+        initErrorDiffusionState(ctx.ditherState, ctx.ditherCurr, ctx.ditherNext, ctx.dstWidth);
+    if (!ctx.useErrorDiffusion) {
+      LOG_DBG("PNG", "Error diffusion unavailable for width=%d, using ordered dither", ctx.dstWidth);
+    }
+  }
 
   LOG_DBG("PNG", "PNG %dx%d -> %dx%d (scale %.2f), bpp: %d", ctx.srcWidth, ctx.srcHeight, ctx.dstWidth, ctx.dstHeight,
           ctx.scale, png->getBpp());
@@ -354,6 +390,17 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     return false;
   }
 
+  if (ctx.useErrorDiffusion) {
+    ctx.toneRowA = static_cast<uint8_t*>(malloc(ctx.dstWidth));
+    ctx.toneRowB = static_cast<uint8_t*>(malloc(ctx.dstWidth));
+    if (!ctx.toneRowA || !ctx.toneRowB) {
+      LOG_DBG("PNG", "Adaptive tone rows unavailable, continuing without neighborhood adaptation");
+      freeAdaptiveToneRows(ctx);
+    } else {
+      attachToneRows(ctx.ditherState, ctx.toneRowA, ctx.toneRowB);
+    }
+  }
+
   // Allocate cache buffer using SCALED dimensions.
   // PNG decode is fast enough (~135ms for 400x600) that caching provides minimal benefit
   // for larger images, while the cache buffer competes with the 44KB PNG decoder for heap.
@@ -382,6 +429,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     LOG_ERR("PNG", "Decode failed: %d", rc);
     png->close();
     delete png;
+    freeAdaptiveToneRows(ctx);
     return false;
   }
 
@@ -393,6 +441,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   if (ctx.caching) {
     ctx.cache.writeToFile(config.cachePath);
   }
+
+  freeAdaptiveToneRows(ctx);
 
   return true;
 }

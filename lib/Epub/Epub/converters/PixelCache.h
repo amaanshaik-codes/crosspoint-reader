@@ -7,6 +7,18 @@
 #include <cstring>
 #include <string>
 
+namespace ImagePixelCache {
+constexpr uint32_t kMagic = 0x32584350;  // "PXC2" little-endian
+constexpr uint16_t kVersion = 1;
+
+struct Header {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t width;
+  uint16_t height;
+};
+}  // namespace ImagePixelCache
+
 // Cache buffer for storing 2-bit pixels (4 levels) during decode.
 // Packs 4 pixels per byte, MSB first.
 struct PixelCache {
@@ -62,14 +74,18 @@ struct PixelCache {
       return false;
     }
 
-    uint16_t w = width;
-    uint16_t h = height;
-    cacheFile.write(&w, 2);
-    cacheFile.write(&h, 2);
+    ImagePixelCache::Header header;
+    header.magic = ImagePixelCache::kMagic;
+    header.version = ImagePixelCache::kVersion;
+    header.width = static_cast<uint16_t>(width);
+    header.height = static_cast<uint16_t>(height);
+
+    cacheFile.write(&header, sizeof(header));
     cacheFile.write(buffer, bytesPerRow * height);
     cacheFile.close();
 
-    LOG_DBG("IMG", "Cache written: %s (%dx%d, %d bytes)", cachePath.c_str(), width, height, 4 + bytesPerRow * height);
+    LOG_DBG("IMG", "Cache written: %s (%dx%d, %d bytes)", cachePath.c_str(), width, height,
+            (int)(sizeof(header) + bytesPerRow * height));
     return true;
   }
 

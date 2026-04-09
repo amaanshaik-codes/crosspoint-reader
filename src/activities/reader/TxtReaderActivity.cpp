@@ -25,6 +25,9 @@ constexpr uint8_t CACHE_VERSION = 2;          // Increment when cache format cha
 void TxtReaderActivity::onEnter() {
   Activity::onEnter();
 
+  // Ignore one loop tick of button events right after activity switch.
+  skipNextButtonCheck = true;
+
   if (!txt) {
     return;
   }
@@ -58,6 +61,11 @@ void TxtReaderActivity::onExit() {
 }
 
 void TxtReaderActivity::loop() {
+  if (skipNextButtonCheck) {
+    skipNextButtonCheck = false;
+    return;
+  }
+
   // Long press BACK (1s+) goes to file selection
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(txt ? txt->getPath() : "");

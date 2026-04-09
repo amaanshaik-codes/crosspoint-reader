@@ -28,6 +28,9 @@ constexpr unsigned long goHomeMs = 1000;
 void XtcReaderActivity::onEnter() {
   Activity::onEnter();
 
+  // Ignore one loop tick of button events right after activity switch.
+  skipNextButtonCheck = true;
+
   if (!xtc) {
     return;
   }
@@ -55,6 +58,11 @@ void XtcReaderActivity::onExit() {
 }
 
 void XtcReaderActivity::loop() {
+  if (skipNextButtonCheck) {
+    skipNextButtonCheck = false;
+    return;
+  }
+
   // Enter chapter selection activity
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     if (xtc && xtc->hasChapters() && !xtc->getChapters().empty()) {

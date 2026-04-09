@@ -6,10 +6,10 @@
 
 #include "../converters/DirectPixelWriter.h"
 #include "../converters/ImageDecoderFactory.h"
+#include "../converters/PixelCache.h"
 
-// Cache file format:
-// - uint16_t width
-// - uint16_t height
+// Cache file format (v2):
+// - ImagePixelCache::Header {magic, version, width, height}
 // - uint8_t pixels[...] - 2 bits per pixel, packed (4 pixels per byte), row-major order
 
 ImageBlock::ImageBlock(const std::string& imagePath, int16_t width, int16_t height)
@@ -35,11 +35,20 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
     return false;
   }
 
-  uint16_t cachedWidth, cachedHeight;
-  if (cacheFile.read(&cachedWidth, 2) != 2 || cacheFile.read(&cachedHeight, 2) != 2) {
+  ImagePixelCache::Header header;
+  if (cacheFile.read(&header, sizeof(header)) != (int)sizeof(header)) {
     cacheFile.close();
     return false;
   }
+
+  if (header.magic != ImagePixelCache::kMagic || header.version != ImagePixelCache::kVersion) {
+    LOG_DBG("IMG", "Ignoring stale image cache format: %s", cachePath.c_str());
+    cacheFile.close();
+    return false;
+  }
+
+  const uint16_t cachedWidth = header.width;
+  const uint16_t cachedHeight = header.height;
 
   // Verify dimensions are close (allow 1 pixel tolerance for rounding differences)
   int widthDiff = abs(cachedWidth - expectedWidth);

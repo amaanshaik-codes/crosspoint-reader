@@ -10,30 +10,39 @@
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes)
+                                               const bool hasFootnotes, const bool hasDictionary,
+                                               const bool hasLookupHistory)
     : Activity("EpubReaderMenu", renderer, mappedInput),
-      menuItems(buildMenuItems(hasFootnotes)),
+      menuItems(buildMenuItems(hasFootnotes, hasDictionary, hasLookupHistory)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent) {}
 
-std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes) {
+std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes,
+                                                                                      bool hasDictionary,
+                                                                                      bool hasLookupHistory) {
   std::vector<MenuItem> items;
-  items.reserve(10);
-  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
+  items.reserve(12);
+  items.push_back({MenuAction::SELECT_CHAPTER, tr(STR_SELECT_CHAPTER)});
   if (hasFootnotes) {
-    items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
+    items.push_back({MenuAction::FOOTNOTES, tr(STR_FOOTNOTES)});
   }
-  items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
-  items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_PAGES_PER_MIN});
-  items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
-  items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
-  items.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
-  items.push_back({MenuAction::GO_HOME, StrId::STR_GO_HOME_BUTTON});
-  items.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-  items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
+  if (hasDictionary) {
+    items.push_back({MenuAction::LOOKUP, "Lookup"});
+    if (hasLookupHistory) {
+      items.push_back({MenuAction::LOOKED_UP_WORDS, "Lookup History"});
+    }
+  }
+  items.push_back({MenuAction::ROTATE_SCREEN, tr(STR_ORIENTATION)});
+  items.push_back({MenuAction::AUTO_PAGE_TURN, tr(STR_AUTO_TURN_PAGES_PER_MIN)});
+  items.push_back({MenuAction::GO_TO_PERCENT, tr(STR_GO_TO_PERCENT)});
+  items.push_back({MenuAction::SCREENSHOT, tr(STR_SCREENSHOT_BUTTON)});
+  items.push_back({MenuAction::DISPLAY_QR, tr(STR_DISPLAY_QR)});
+  items.push_back({MenuAction::GO_HOME, tr(STR_GO_HOME_BUTTON)});
+  items.push_back({MenuAction::SYNC, tr(STR_SYNC_PROGRESS)});
+  items.push_back({MenuAction::DELETE_CACHE, tr(STR_DELETE_CACHE)});
   return items;
 }
 
@@ -132,7 +141,7 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
       renderer.fillRect(contentX, displayY, contentWidth - 1, lineHeight, true);
     }
 
-    renderer.drawText(UI_10_FONT_ID, contentX + 20, displayY, I18N.get(menuItems[i].labelId), !isSelected);
+    renderer.drawText(UI_10_FONT_ID, contentX + 20, displayY, menuItems[i].label.c_str(), !isSelected);
 
     if (menuItems[i].action == MenuAction::ROTATE_SCREEN) {
       // Render current orientation value on the right edge of the content area.

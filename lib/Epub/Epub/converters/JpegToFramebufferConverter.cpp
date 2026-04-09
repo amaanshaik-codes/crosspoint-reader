@@ -38,7 +38,25 @@ struct JpegContext {
 
   PixelCache cache;
   bool caching{false};
+
+  bool useErrorDiffusion{false};
+  int16_t ditherCurr[kMaxErrorDiffusionWidth + 2]{};
+  int16_t ditherNext[kMaxErrorDiffusionWidth + 2]{};
+  ErrorDiffusionState ditherState;
+  uint8_t* toneRowA{nullptr};
+  uint8_t* toneRowB{nullptr};
 };
+
+void freeAdaptiveToneRows(JpegContext& ctx) {
+  if (ctx.toneRowA) {
+    free(ctx.toneRowA);
+    ctx.toneRowA = nullptr;
+  }
+  if (ctx.toneRowB) {
+    free(ctx.toneRowB);
+    ctx.toneRowB = nullptr;
+  }
+}
 
 // File I/O callbacks use pFile->fHandle to access the FsFile*,
 // avoiding the need for global file state.
@@ -124,6 +142,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   if (stride <= 0 || blockH <= 0 || validW <= 0) return 1;
 
   const bool useDithering = ctx->config->useDithering;
+  const bool useErrorDiffusion = ctx->useErrorDiffusion;
   const bool caching = ctx->caching;
   const int32_t fineScaleFP = ctx->fineScaleFP;
   const int32_t invScaleFP = ctx->invScaleFP;
@@ -164,6 +183,16 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.originX);
   }
 
+  auto quantizePixel = [&](uint8_t gray, int localX, int outX, int outY) -> uint8_t {
+    if (useDithering) {
+      if (useErrorDiffusion) {
+        return applyErrorDiffusion4Level(gray, localX, outY, ctx->ditherState);
+      }
+      return applyBayerDither4Level(gray, outX, outY);
+    }
+    return quantizeImage4LevelNoDither(gray);
+  };
+
   // === 1:1 fast path: no scaling math ===
   if (fineScaleFP == FP_ONE) {
     for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
@@ -174,13 +203,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
       for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
         const int outX = cfgX + dstX;
         uint8_t gray = row[dstX - blockX];
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        uint8_t dithered = quantizePixel(gray, dstX, outX, outY);
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -233,13 +256,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        uint8_t dithered = quantizePixel(gray, dstX, outX, outY);
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -256,13 +273,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx0 + 1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        uint8_t dithered = quantizePixel(gray, dstX, outX, outY);
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -282,13 +293,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        uint8_t dithered = quantizePixel(gray, dstX, outX, outY);
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -315,13 +320,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
       if (lx >= validW) lx = validW - 1;
       uint8_t gray = row[lx];
 
-      uint8_t dithered;
-      if (useDithering) {
-        dithered = applyBayerDither4Level(gray, outX, outY);
-      } else {
-        dithered = gray / 85;
-        if (dithered > 3) dithered = 3;
-      }
+      uint8_t dithered = quantizePixel(gray, dstX, outX, outY);
       pw.writePixel(outX, dithered);
       if (caching) cw.writePixel(outX, dithered);
     }
@@ -448,6 +447,22 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   ctx.dstHeight = destHeight;
   ctx.fineScaleFP = (int32_t)((int64_t)destWidth * FP_ONE / ctx.scaledSrcWidth);
   ctx.invScaleFP = (int32_t)((int64_t)ctx.scaledSrcWidth * FP_ONE / destWidth);
+  if (config.useDithering) {
+    ctx.useErrorDiffusion =
+        initErrorDiffusionState(ctx.ditherState, ctx.ditherCurr, ctx.ditherNext, ctx.dstWidth);
+    if (!ctx.useErrorDiffusion) {
+      LOG_DBG("JPG", "Error diffusion unavailable for width=%d, using ordered dither", ctx.dstWidth);
+    } else {
+      ctx.toneRowA = static_cast<uint8_t*>(malloc(ctx.dstWidth));
+      ctx.toneRowB = static_cast<uint8_t*>(malloc(ctx.dstWidth));
+      if (!ctx.toneRowA || !ctx.toneRowB) {
+        LOG_DBG("JPG", "Adaptive tone rows unavailable, continuing without neighborhood adaptation");
+        freeAdaptiveToneRows(ctx);
+      } else {
+        attachToneRows(ctx.ditherState, ctx.toneRowA, ctx.toneRowB);
+      }
+    }
+  }
 
   LOG_DBG("JPG", "JPEG %dx%d -> %dx%d (scale %.2f, jpegScale 1/%d, fineScale %.2f)%s", srcWidth, srcHeight, destWidth,
           destHeight, targetScale, jpegScaleDenom, (float)destWidth / ctx.scaledSrcWidth,
@@ -474,6 +489,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
     jpeg->close();
     delete jpeg;
+    freeAdaptiveToneRows(ctx);
     return false;
   }
 
@@ -485,6 +501,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   if (ctx.caching) {
     ctx.cache.writeToFile(config.cachePath);
   }
+
+  freeAdaptiveToneRows(ctx);
 
   return true;
 }

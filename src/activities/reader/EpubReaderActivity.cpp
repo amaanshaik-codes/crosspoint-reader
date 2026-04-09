@@ -12,17 +12,21 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "DictionaryWordSelectActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnotesActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
+#include "LookedUpWordsActivity.h"
 #include "MappedInputManager.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/Dictionary.h"
+#include "util/LookupHistory.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -145,9 +149,11 @@ void EpubReaderActivity::loop() {
       bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
     }
     const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+    const bool hasDictionary = Dictionary::exists();
+    const bool hasLookupHistory = hasDictionary && LookupHistory::hasHistory(epub->getCachePath());
     startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                               SETTINGS.orientation, !currentPageFootnotes.empty()),
+                               SETTINGS.orientation, !currentPageFootnotes.empty(), hasDictionary, hasLookupHistory),
                            [this](const ActivityResult& result) {
                              // Always apply orientation change even if the menu was cancelled
                              const auto& menu = std::get<MenuResult>(result.data);
@@ -326,6 +332,82 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               jumpToPercent(std::get<PercentResult>(result.data).percent);
             }
           });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      std::unique_ptr<Page> pageForLookup;
+      std::string nextPageFirstWord;
+      int orientedMarginTop = 0;
+      int orientedMarginLeft = 0;
+
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          break;
+        }
+
+        int orientedMarginRight;
+        int orientedMarginBottom;
+        renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                         &orientedMarginLeft);
+        orientedMarginTop += SETTINGS.screenMargin;
+        orientedMarginLeft += SETTINGS.screenMargin;
+        orientedMarginRight += SETTINGS.screenMargin;
+
+        const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottom +=
+              std::max(SETTINGS.screenMargin,
+                       static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
+        }
+
+        pageForLookup = section->loadPageFromSectionFile();
+
+        if (section->currentPage < section->pageCount - 1) {
+          const int savedPage = section->currentPage;
+          section->currentPage = savedPage + 1;
+          auto nextPage = section->loadPageFromSectionFile();
+          section->currentPage = savedPage;
+
+          if (nextPage) {
+            for (const auto& element : nextPage->elements) {
+              if (!element || element->getTag() != TAG_PageLine) {
+                continue;
+              }
+
+              const auto& line = static_cast<const PageLine&>(*element);
+              if (!line.getBlock()) {
+                continue;
+              }
+
+              const auto& words = line.getBlock()->getWords();
+              if (!words.empty()) {
+                nextPageFirstWord = words.front();
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (pageForLookup) {
+        startActivityForResult(
+            std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(pageForLookup),
+                                                           SETTINGS.getReaderFontId(), orientedMarginLeft,
+                                                           orientedMarginTop, epub->getCachePath(), SETTINGS.orientation,
+                                                           nextPageFirstWord),
+            [this](const ActivityResult& result) { requestUpdate(); });
+      }
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKED_UP_WORDS: {
+      startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath(),
+                                                                     SETTINGS.getReaderFontId()),
+                             [this](const ActivityResult& result) { requestUpdate(); });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::DISPLAY_QR: {
@@ -716,8 +798,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   LOG_DBG("ERS", "Heap: before=%lu after=%lu delta=%ld", heapBefore, heapAfter,
           (int32_t)heapAfter - (int32_t)heapBefore);
 
+  const bool pageHasImages = page->hasImages();
   // Force special handling for pages with images when anti-aliasing is on
-  bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
+  const bool imagePageWithAA = pageHasImages && SETTINGS.textAntiAliasing;
+  // Applying grayscale text anti-aliasing on image pages noticeably washes out
+  // and softens image details after the initial crisp draw.
+  const bool applyTextAA = SETTINGS.textAntiAliasing && !pageHasImages;
 
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
@@ -748,13 +834,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
-  // Save bw buffer to reset buffer state after grayscale data sync
-  renderer.storeBwBuffer();
-  const auto tBwStore = millis();
-
-  // grayscale rendering
+  // grayscale text anti-aliasing (text-only pages)
   // TODO: Only do this if font supports it
-  if (SETTINGS.textAntiAliasing) {
+  if (applyTextAA) {
+    if (!renderer.storeBwBuffer()) {
+      const auto tEnd = millis();
+      LOG_ERR("ERS", "Failed to store BW buffer for anti-aliasing; skipping AA");
+      LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums", tPrewarm - t0,
+              tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
+      return;
+    }
+    const auto tBwStore = millis();
+
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
@@ -785,15 +876,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
             tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
             tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
   } else {
-    // restore the bw data
-    renderer.restoreBwBuffer();
-    const auto tBwRestore = millis();
-
     const auto tEnd = millis();
-    LOG_DBG("ERS",
-            "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store=%lums bw_restore=%lums total=%lums",
-            tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tBwRestore - tBwStore,
-            tEnd - t0);
+    LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums", tPrewarm - t0,
+            tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
   }
 }
 

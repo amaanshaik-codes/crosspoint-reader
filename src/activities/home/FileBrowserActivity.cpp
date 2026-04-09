@@ -16,6 +16,39 @@
 
 namespace {
 constexpr unsigned long GO_HOME_MS = 1000;
+
+std::string normalizeBasePath(std::string path) {
+  if (path.empty()) {
+    return "/";
+  }
+
+  // Storage APIs expect absolute-style paths.
+  if (path.front() != '/') {
+    path.insert(path.begin(), '/');
+  }
+
+  // Keep root as-is; otherwise trim trailing slash for consistency.
+  while (path.size() > 1 && path.back() == '/') {
+    path.pop_back();
+  }
+
+  auto entry = Storage.open(path.c_str());
+  if (entry) {
+    const bool isDir = entry.isDirectory();
+    entry.close();
+
+    // If a file path is passed, start the browser from its parent folder.
+    if (!isDir) {
+      const auto lastSlash = path.find_last_of('/');
+      if (lastSlash == std::string::npos || lastSlash == 0) {
+        return "/";
+      }
+      path = path.substr(0, lastSlash);
+    }
+  }
+
+  return path.empty() ? "/" : path;
+}
 }  // namespace
 
 void sortFileList(std::vector<std::string>& strs) {
@@ -107,6 +140,8 @@ void FileBrowserActivity::loadFiles() {
 
 void FileBrowserActivity::onEnter() {
   Activity::onEnter();
+
+  basepath = normalizeBasePath(basepath);
 
   loadFiles();
   selectorIndex = 0;
@@ -200,12 +235,17 @@ void FileBrowserActivity::loop() {
       if (basepath != "/") {
         const std::string oldPath = basepath;
 
-        basepath.replace(basepath.find_last_of('/'), std::string::npos, "");
-        if (basepath.empty()) basepath = "/";
+        const auto lastSlash = basepath.find_last_of('/');
+        if (lastSlash == std::string::npos || lastSlash == 0) {
+          basepath = "/";
+        } else {
+          basepath = basepath.substr(0, lastSlash);
+        }
+
         loadFiles();
 
         const auto pos = oldPath.find_last_of('/');
-        const std::string dirName = oldPath.substr(pos + 1) + "/";
+        const std::string dirName = (pos == std::string::npos ? oldPath : oldPath.substr(pos + 1)) + "/";
         selectorIndex = findEntry(dirName);
 
         requestUpdate();
