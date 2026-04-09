@@ -1,25 +1,25 @@
-# CrossPoint Reader - My Experimental Fork
+# Amaan's Crosspoint Reader
 
 This is my personal CrossPoint fork.
 
-I use this firmware as an experimental branch where I can quickly test new ideas and features without being limited by the official project scope. My goal is simple: improve the real reading experience on the XTeink X4 and keep iterating fast.
+I use this firmware as an experimental branch where I can quickly test new ideas and features without being limited by the official project scope.
 
 ## Credits
 
-- Original CrossPoint project and core firmware work: [daveallie](https://github.com/daveallie)
-- Official upstream repository: [crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader)
-- Dictionary feature source/inspiration: [kurtisgrant/crosspoint-reader](https://github.com/kurtisgrant/crosspoint-reader)
+- Shoutout to Dave Alli for making this firmware: [daveallie](https://github.com/daveallie)
+- Official Crosspoint repository: [crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader)
+- Dictionary feature source: [kurtisgrant/crosspoint-reader](https://github.com/kurtisgrant/crosspoint-reader)
 
 ## What I Focus On In This Fork
 
 - Experimental feature work
 - EPUB reading quality and rendering improvements
 - Dictionary lookup and reading-assistance tools
-- UI/UX changes based on practical usage, not strict upstream scope
+- UI/UX changes based on practical usage
 
 ## Dictionary Setup
 
-Dictionary lookup uses StarDict-style files from SD root.
+Dictionary lookup uses StarDict-style files from SD root. The first lookup may be slower while index/cache data is initialized. Later lookups are much faster.
 
 Included in this repo:
 
@@ -41,16 +41,6 @@ Example SD layout:
 └── books...
 ```
 
-The first lookup may be slower while index/cache data is initialized. Later lookups are much faster.
-
-## Demo
-
-<video src="./docs/media/Dict-feat.mp4" controls width="900"></video>
-
-If your viewer does not render the player:
-
-- [Open the demo video](docs/media/Dict-feat.mp4)
-
 ## Build
 
 ```sh
@@ -67,4 +57,4 @@ pio run --target upload
 
 ## Note
 
-This fork is intentionally experimental and may diverge significantly from upstream as I test new functionality.
+This fork is intentionally experimental and may diverge significantly from the main crosspoint reader.
