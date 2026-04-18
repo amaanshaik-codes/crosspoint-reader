@@ -9,6 +9,10 @@
 #include <esp_task_wdt.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 
 #include "CrossPointSettings.h"
 #include "SettingsList.h"
@@ -80,6 +84,34 @@ bool isProtectedItemName(const String& name) {
     }
   }
   return false;
+}
+
+bool parseUploadSizeToken(const String& sizeToken, size_t& outSize) {
+  if (sizeToken.isEmpty()) {
+    return false;
+  }
+
+  int digitStart = (sizeToken[0] == '+') ? 1 : 0;
+  if (digitStart > 0 && sizeToken.length() < 2) {
+    return false;
+  }
+
+  for (int i = digitStart; i < static_cast<int>(sizeToken.length()); i++) {
+    if (!std::isdigit(static_cast<unsigned char>(sizeToken[i]))) {
+      return false;
+    }
+  }
+
+  errno = 0;
+  char* endPtr = nullptr;
+  const unsigned long long parsed = strtoull(sizeToken.c_str(), &endPtr, 10);
+  if (errno == ERANGE || endPtr == nullptr || *endPtr != '\0' ||
+      parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+    return false;
+  }
+
+  outSize = static_cast<size_t>(parsed);
+  return true;
 }
 }  // namespace
 
@@ -1278,18 +1310,13 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         if (firstColon > 0 && secondColon > 0) {
           wsUploadFileName = msg.substring(6, firstColon);
           String sizeToken = msg.substring(firstColon + 1, secondColon);
-          bool sizeValid = sizeToken.length() > 0;
-          int digitStart = (sizeValid && sizeToken[0] == '+') ? 1 : 0;
-          if (digitStart > 0 && sizeToken.length() < 2) sizeValid = false;
-          for (int i = digitStart; i < (int)sizeToken.length() && sizeValid; i++) {
-            if (!isdigit((unsigned char)sizeToken[i])) sizeValid = false;
-          }
-          if (!sizeValid) {
+          size_t parsedUploadSize = 0;
+          if (!parseUploadSizeToken(sizeToken, parsedUploadSize)) {
             LOG_DBG("WS", "START rejected: invalid size token '%s'", sizeToken.c_str());
             wsServer->sendTXT(num, "ERROR:Invalid START format");
             return;
           }
-          wsUploadSize = sizeToken.toInt();
+          wsUploadSize = parsedUploadSize;
           wsUploadPath = msg.substring(secondColon + 1);
           wsUploadReceived = 0;
           wsLastProgressSent = 0;

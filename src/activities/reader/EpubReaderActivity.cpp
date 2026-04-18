@@ -32,6 +32,8 @@
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
 constexpr unsigned long skipChapterMs = 700;
+constexpr int maxSectionBuildRetries = 2;
+constexpr int maxPageLoadRetries = 2;
 // pages per minute, first item is 1 to prevent division by zero if accessed
 const std::vector<int> PAGE_TURN_LABELS = {1, 1, 3, 6, 12};
 
@@ -59,7 +61,10 @@ void EpubReaderActivity::onEnter() {
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
   epub->setupCacheDir();
+  sectionBuildFailureCount = 0;
+  pageLoadFailureCount = 0;
 
+  bool hasCachedProgress = false;
   FsFile f;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
     uint8_t data[6];
@@ -68,6 +73,7 @@ void EpubReaderActivity::onEnter() {
       currentSpineIndex = data[0] + (data[1] << 8);
       nextPageNumber = data[2] + (data[3] << 8);
       cachedSpineIndex = currentSpineIndex;
+      hasCachedProgress = true;
       LOG_DBG("ERS", "Loaded cache: %d, %d", currentSpineIndex, nextPageNumber);
     }
     if (dataSize == 6) {
@@ -75,9 +81,9 @@ void EpubReaderActivity::onEnter() {
     }
     f.close();
   }
-  // We may want a better condition to detect if we are opening for the first time.
-  // This will trigger if the book is re-opened at Chapter 0.
-  if (currentSpineIndex == 0) {
+
+  // Use text-reference only when we have no cached reading position.
+  if (!hasCachedProgress) {
     int textSpineIndex = epub->getSpineIndexForTextReference();
     if (textSpineIndex != 0) {
       currentSpineIndex = textSpineIndex;
@@ -102,6 +108,8 @@ void EpubReaderActivity::onExit() {
 
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
+  sectionBuildFailureCount = 0;
+  pageLoadFailureCount = 0;
   section.reset();
   epub.reset();
 }
@@ -638,11 +646,26 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                       SETTINGS.imageRendering, popupFn)) {
         LOG_ERR("ERS", "Failed to persist page data to SD");
         section.reset();
+
+        sectionBuildFailureCount++;
+        if (sectionBuildFailureCount <= maxSectionBuildRetries) {
+          LOG_ERR("ERS", "Retrying section build (%d/%d)", sectionBuildFailureCount, maxSectionBuildRetries);
+          requestUpdate();
+          return;
+        }
+
+        automaticPageTurnActive = false;
+        renderer.clearScreen();
+        renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+        renderer.drawCenteredText(UI_10_FONT_ID, 340, tr(STR_RETRY));
+        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         return;
       }
     } else {
       LOG_DBG("ERS", "Cache found, skipping build...");
     }
+
+    sectionBuildFailureCount = 0;
 
     if (nextPageNumber == UINT16_MAX) {
       section->currentPage = section->pageCount - 1;
@@ -708,11 +731,23 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
       section->clearCache();
       section.reset();
-      requestUpdate();  // Try again after clearing cache
-                        // TODO: prevent infinite loop if the page keeps failing to load for some reason
+
+      pageLoadFailureCount++;
+      if (pageLoadFailureCount <= maxPageLoadRetries) {
+        LOG_ERR("ERS", "Retrying page load (%d/%d)", pageLoadFailureCount, maxPageLoadRetries);
+        requestUpdate();
+        return;
+      }
+
       automaticPageTurnActive = false;
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.drawCenteredText(UI_10_FONT_ID, 340, tr(STR_RETRY));
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       return;
     }
+
+    pageLoadFailureCount = 0;
 
     // Collect footnotes from the loaded page
     currentPageFootnotes = std::move(p->footnotes);
@@ -766,8 +801,8 @@ void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
   FsFile f;
   if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/progress.bin", f)) {
     uint8_t data[6];
-    data[0] = currentSpineIndex & 0xFF;
-    data[1] = (currentSpineIndex >> 8) & 0xFF;
+    data[0] = spineIndex & 0xFF;
+    data[1] = (spineIndex >> 8) & 0xFF;
     data[2] = currentPage & 0xFF;
     data[3] = (currentPage >> 8) & 0xFF;
     data[4] = pageCount & 0xFF;
@@ -811,6 +846,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto tBwRender = millis();
 
   if (imagePageWithAA) {
+    const auto displayImagePassWithCadence = [this]() {
+      if (pagesUntilFullRefresh <= 1) {
+        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+        pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+      } else {
+        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+        pagesUntilFullRefresh--;
+      }
+    };
+
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
     // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.
     // Instead, blank only the image area and do two fast refreshes.
@@ -824,11 +869,11 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      displayImagePassWithCadence();
     } else {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      displayImagePassWithCadence();
     }
-    // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
+    // Double FAST_REFRESH handles ghosting for image pages while still honoring refresh cadence.
   } else {
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
@@ -884,9 +929,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
 void EpubReaderActivity::renderStatusBar() const {
   // Calculate progress in book
-  const int currentPage = section->currentPage + 1;
+  const int displayCurrentPage = section->currentPage + 1;
   const float pageCount = section->pageCount;
-  const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) : 0;
+  const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(section->currentPage) / pageCount) : 0;
   const float bookProgress = epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100;
 
   std::string title;
@@ -916,7 +961,7 @@ void EpubReaderActivity::renderStatusBar() const {
     title = epub->getTitle();
   }
 
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset);
+  GUI.drawStatusBar(renderer, bookProgress, displayCurrentPage, pageCount, title, 0, textYOffset);
 }
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {

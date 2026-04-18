@@ -211,11 +211,24 @@ bool Epub::parseTocNavFile() const {
   if (!Storage.openFileForWrite("EBP", tmpNavPath, tempNavFile)) {
     return false;
   }
-  readItemContentsToStream(tocNavItem, tempNavFile, 1024);
-  tempNavFile.close();
-  if (!Storage.openFileForRead("EBP", tmpNavPath, tempNavFile)) {
+  if (!readItemContentsToStream(tocNavItem, tempNavFile, 1024)) {
+    tempNavFile.close();
+    Storage.remove(tmpNavPath.c_str());
     return false;
   }
+  tempNavFile.close();
+  if (!Storage.openFileForRead("EBP", tmpNavPath, tempNavFile)) {
+    Storage.remove(tmpNavPath.c_str());
+    return false;
+  }
+
+  const auto cleanupTmpNav = [&tempNavFile, &tmpNavPath]() {
+    if (tempNavFile) {
+      tempNavFile.close();
+    }
+    Storage.remove(tmpNavPath.c_str());
+  };
+
   const auto navSize = tempNavFile.size();
 
   // Note: We can't use `contentBasePath` here as the nav file may be in a different folder to the content.opf
@@ -225,12 +238,14 @@ bool Epub::parseTocNavFile() const {
 
   if (!navParser.setup()) {
     LOG_ERR("EBP", "Could not setup toc nav parser");
+    cleanupTmpNav();
     return false;
   }
 
   const auto navBuffer = static_cast<uint8_t*>(malloc(1024));
   if (!navBuffer) {
     LOG_ERR("EBP", "Could not allocate memory for toc nav parser");
+    cleanupTmpNav();
     return false;
   }
 
@@ -241,14 +256,13 @@ bool Epub::parseTocNavFile() const {
     if (processedSize != readSize) {
       LOG_ERR("EBP", "Could not process all toc nav data");
       free(navBuffer);
-      tempNavFile.close();
+      cleanupTmpNav();
       return false;
     }
   }
 
   free(navBuffer);
-  tempNavFile.close();
-  Storage.remove(tmpNavPath.c_str());
+  cleanupTmpNav();
 
   LOG_DBG("EBP", "Parsed TOC nav items");
   return true;

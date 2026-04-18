@@ -181,8 +181,8 @@ void XtcReaderActivity::renderPage() {
 
   // Load page data
   size_t bytesRead = xtc->loadPage(currentPage, pageBuffer, pageBufferSize);
-  if (bytesRead == 0) {
-    LOG_ERR("XTR", "Failed to load page %lu", currentPage);
+  if (bytesRead != pageBufferSize) {
+    LOG_ERR("XTR", "Failed to load full page %lu (got %lu, expected %lu)", currentPage, bytesRead, pageBufferSize);
     free(pageBuffer);
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
